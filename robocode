@@ -1,0 +1,255 @@
+package myrobots;
+
+import robocode.*;
+import robocode.util.Utils;
+import java.awt.Color;
+import java.awt.geom.Point2D;
+import java.util.ArrayList;
+import java.util.List;
+
+public class AdvancedBot extends AdvancedRobot {
+    private static final int BINS = 47;
+    private static final int SURF_STATS = 400;
+    
+    private List<EnemyWave> enemyWaves;
+    private List<Integer>[] surfStats;
+    private EnemyBot enemy = new EnemyBot();
+    private Point2D.Double myLocation;
+    private double lateralDirection;
+    private double lastEnemyVelocity;
+    
+    public void run() {
+        setColors(Color.BLUE, Color.BLACK, Color.YELLOW);
+        setBulletColor(Color.YELLOW);
+        
+        enemyWaves = new ArrayList<EnemyWave>();
+        surfStats = new ArrayList[BINS];
+        for (int i = 0; i < BINS; i++) {
+            surfStats[i] = new ArrayList<Integer>();
+        }
+        
+        lateralDirection = 1;
+        myLocation = new Point2D.Double(getX(), getY());
+        
+        setAdjustGunForRobotTurn(true);
+        setAdjustRadarForGunTurn(true);
+        
+        do {
+            turnRadarRightRadians(Double.POSITIVE_INFINITY);
+        } while (true);
+    }
+    
+    public void onScannedRobot(ScannedRobotEvent e) {
+        enemy.update(e);
+        
+        double lateralVelocity = getVelocity() * Math.sin(e.getBearingRadians());
+        double absBearing = e.getBearingRadians() + getHeadingRadians();
+        
+        setTurnRadarRightRadians(Utils.normalRelativeAngle(absBearing - getRadarHeadingRadians()) * 2);
+        
+        surfWave();
+        doSurfing();
+        
+        // Predictive firing
+        if (getEnergy() > 1) {
+            double firepower = Math.min(3, Math.min(getEnergy() / 4, 1300 / enemy.getDistance()));
+            double avgVelocity = (enemy.getVelocity() + lastEnemyVelocity) / 2;
+            lastEnemyVelocity = enemy.getVelocity();
+            
+            long time = (long)(enemy.getDistance() / (20 - (3 * firepower)));
+            double futureX = enemy.getFutureX(time);
+            double futureY = enemy.getFutureY(time);
+            
+            double absDeg = Utils.normalAbsoluteAngle(Math.atan2(futureX - getX(), futureY - getY()));
+            setTurnGunRightRadians(Utils.normalRelativeAngle(absDeg - getGunHeadingRadians()));
+            
+            if (getGunHeat() == 0 && Math.abs(getGunTurnRemaining()) < 10) {
+                setFire(firepower);
+            }
+        }
+    }
+    
+    private void surfWave() {
+        Point2D.Double enemyLocation = enemy.getLocation();
+        EnemyWave surfWave = getClosestSurfableWave();
+        
+        if (surfWave == null) { return; }
+        
+        double dangerLeft = checkDanger(surfWave, -1);
+        double dangerRight = checkDanger(surfWave, 1);
+        
+        double goAngle = absoluteBearing(surfWave.fireLocation, myLocation);
+        if (dangerLeft < dangerRight) {
+            goAngle = wallSmoothing(myLocation, goAngle - (Math.PI/2), -1);
+        } else {
+            goAngle = wallSmoothing(myLocation, goAngle + (Math.PI/2), 1);
+        }
+        
+        setBackAsFront(this, goAngle);
+    }
+    
+    private EnemyWave getClosestSurfableWave() {
+        double closestDistance = Double.POSITIVE_INFINITY;
+        EnemyWave surfWave = null;
+        
+        for (EnemyWave ew : enemyWaves) {
+            double distance = myLocation.distance(ew.fireLocation) - ew.distanceTraveled;
+            if (distance > ew.bulletVelocity && distance < closestDistance) {
+                surfWave = ew;
+                closestDistance = distance;
+            }
+        }
+        
+        return surfWave;
+    }
+    
+    private double checkDanger(EnemyWave surfWave, int direction) {
+        int index = getFactorIndex(surfWave, myLocation, direction);
+        return surfStats[index].stream().mapToDouble(Integer::doubleValue).sum();
+    }
+    
+    private void doSurfing() {
+        EnemyWave ew = getClosestSurfableWave();
+        if (ew == null) { return; }
+        
+        double goAngle = absoluteBearing(ew.fireLocation, myLocation);
+        goAngle = wallSmoothing(myLocation, goAngle + (lateralDirection * (Math.PI/2)), lateralDirection);
+        setBackAsFront(this, goAngle);
+    }
+    
+    private static double wallSmoothing(Point2D.Double botLocation, double angle, int orientation) {
+        while (!fieldRectangle.contains(project(botLocation, angle, WALL_STICK))) {
+            angle += orientation * 0.05;
+        }
+        return angle;
+    }
+    
+    private static Point2D.Double project(Point2D.Double sourceLocation, double angle, double length) {
+        return new Point2D.Double(sourceLocation.x + Math.sin(angle) * length,
+                                  sourceLocation.y + Math.cos(angle) * length);
+    }
+    
+    private static double absoluteBearing(Point2D.Double source, Point2D.Double target) {
+        return Math.atan2(target.x - source.x, target.y - source.y);
+    }
+    
+    private static void setBackAsFront(AdvancedRobot robot, double goAngle) {
+        double angle = Utils.normalRelativeAngle(goAngle - robot.getHeadingRadians());
+        if (Math.abs(angle) > (Math.PI/2)) {
+            if (angle < 0) {
+                robot.setTurnRightRadians(Math.PI + angle);
+            } else {
+                robot.setTurnLeftRadians(Math.PI - angle);
+            }
+            robot.setBack(100);
+        } else {
+            if (angle < 0) {
+                robot.setTurnLeftRadians(-1 * angle);
+            } else {
+                robot.setTurnRightRadians(angle);
+            }
+            robot.setAhead(100);
+        }
+    }
+    
+    private static int getFactorIndex(EnemyWave ew, Point2D.Double target, int direction) {
+        double offset = (absoluteBearing(ew.fireLocation, target) - ew.directAngle);
+        double factor = Utils.normalRelativeAngle(offset) / maxEscapeAngle(ew.bulletVelocity) * direction;
+        return (int)limit(0, (factor * ((BINS - 1) / 2)) + ((BINS - 1) / 2), BINS - 1);
+    }
+    
+    private static double limit(double min, double value, double max) {
+        return Math.max(min, Math.min(value, max));
+    }
+    
+    private static double maxEscapeAngle(double velocity) {
+        return Math.asin(8.0 / velocity);
+    }
+    
+    public void onHitByBullet(HitByBulletEvent e) {
+        // When hit, update our stats
+        if (!enemyWaves.isEmpty()) {
+            Point2D.Double hitBulletLocation = new Point2D.Double(e.getBullet().getX(), e.getBullet().getY());
+            EnemyWave hitWave = null;
+            
+            for (EnemyWave ew : enemyWaves) {
+                if (Math.abs(ew.distanceTraveled - myLocation.distance(ew.fireLocation)) < 50 &&
+                    Math.abs(bulletVelocity(e.getBullet().getPower()) - ew.bulletVelocity) < 0.001) {
+                    hitWave = ew;
+                    break;
+                }
+            }
+            
+            if (hitWave != null) {
+                logHit(hitWave, hitBulletLocation);
+                enemyWaves.remove(enemyWaves.lastIndexOf(hitWave));
+            }
+        }
+    }
+    
+    private void logHit(EnemyWave ew, Point2D.Double targetLocation) {
+        int index = getFactorIndex(ew, targetLocation, lateralDirection);
+        
+        for (int i = 0; i < BINS; i++) {
+            surfStats[i].add(1);
+        }
+        surfStats[index].add(SURF_STATS);
+    }
+    
+    private static double bulletVelocity(double power) {
+        return (20.0 - (3.0 * power));
+    }
+    
+    private class EnemyWave {
+        Point2D.Double fireLocation;
+        long fireTime;
+        double bulletVelocity, directAngle, distanceTraveled;
+        int direction;
+
+        EnemyWave(Point2D.Double fireLocation, long fireTime, double bulletVelocity, double directAngle, int direction) {
+            this.fireLocation = fireLocation;
+            this.fireTime = fireTime;
+            this.bulletVelocity = bulletVelocity;
+            this.directAngle = directAngle;
+            this.direction = direction;
+        }
+    }
+    
+    private class EnemyBot {
+        private double bearing;
+        private double distance;
+        private double energy;
+        private double heading;
+        private double velocity;
+        private String name;
+        
+        public void update(ScannedRobotEvent e) {
+            bearing = e.getBearing();
+            distance = e.getDistance();
+            energy = e.getEnergy();
+            heading = e.getHeading();
+            velocity = e.getVelocity();
+            name = e.getName();
+        }
+        
+        public Point2D.Double getLocation() {
+            return projectLocation(getHeadingRadians(), enemy.distance);
+        }
+        
+        private Point2D.Double projectLocation(double angle, double length) {
+            return new Point2D.Double(getX() + Math.sin(angle) * length,
+                                      getY() + Math.cos(angle) * length);
+        }
+        
+        public double getFutureX(long when){
+            return getX() + Math.sin(getHeadingRadians()) * getVelocity() * when;
+        }
+        
+        public double getFutureY(long when){
+            return getY() + Math.cos(getHeadingRadians()) * getVelocity() * when;
+        }
+        
+        public double getDistance() { return distance; }
+        public double getVelocity() { return velocity; }
+    }
+}
